@@ -1,0 +1,9 @@
+metrics_to_run:
+  - specbridge_contract
+  - specbridge_response_quality
+
+custom_metrics:
+  - name: specbridge_contract
+    custom_function_file: structural_contract.py
+  - name: specbridge_response_quality
+    custom_function_file: response_quality.py

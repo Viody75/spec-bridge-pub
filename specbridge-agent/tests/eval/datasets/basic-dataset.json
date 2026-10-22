@@ -1,0 +1,46 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "rough_po_note_with_missing_threshold",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "{\"run_id\":\"00000000-0000-0000-0000-000000000001\",\"request\":{\"project_id\":\"eval-rough-notes\",\"document_type\":\"PRD\",\"sources\":[{\"source_id\":\"po-note-1\",\"source_type\":\"docx\",\"title\":\"Catatan kasar PO\",\"content\":\"Pengguna harus bisa melihat status pengajuan. Statusnya harus cepat ter-update, tetapi belum disepakati berapa detik. Hanya Product Owner yang boleh menyetujui publikasi requirement final.\",\"metadata\":{}}]},\"policy\":{\"standard\":\"ISO/IEC/IEEE 29148 §5.2.5\",\"max_deliberation_rounds\":2,\"human_gates\":[\"conflict_resolution\",\"document_publication\"]}}"
+          }
+        ]
+      },
+      "reference": {
+        "response": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Extract the visible-status need with source evidence; do not invent a numeric freshness threshold; all five roles review every candidate in both rounds; escalate missing material context to the Product Owner; keep publication_ready false."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "eval_case_id": "meeting_timeout_conflict",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "{\"run_id\":\"00000000-0000-0000-0000-000000000002\",\"request\":{\"project_id\":\"eval-conflict\",\"document_type\":\"SRS\",\"sources\":[{\"source_id\":\"meeting-1\",\"source_type\":\"meeting_transcript\",\"title\":\"Security and service review\",\"content\":\"[00:04:10] Security: Sesi pengguna wajib berakhir otomatis setelah 5 menit tidak aktif. [00:05:02] Customer Service: Jangan keluarkan agen sebelum 30 menit tidak aktif karena mereka sering membaca kasus panjang. [00:06:15] PO: Kita belum memutuskan angka final.\",\"locator\":{\"section\":\"Session timeout discussion\"},\"metadata\":{}}]},\"policy\":{\"standard\":\"ISO/IEC/IEEE 29148 §5.2.5\",\"max_deliberation_rounds\":2,\"human_gates\":[\"conflict_resolution\",\"document_publication\"]}}"
+          }
+        ]
+      },
+      "reference": {
+        "response": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Preserve both timeout positions and exact evidence; record rather than automatically resolve the conflict; require Product Owner context or preserve unresolved dissent; expose resolution options; keep publication_ready false."
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
