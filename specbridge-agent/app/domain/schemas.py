@@ -153,7 +153,62 @@ class WorkspaceDocumentView(StrictModel):
     decided_at: datetime | None = None
     # Section index (as a string) -> who rewrote that section body and when
     section_edits: dict[str, SectionEdit] = Field(default_factory=dict)
+    validation: DocumentValidation | None = None
+    history: list[DocumentHistoryEntry] = Field(default_factory=list)
     created_at: datetime
+
+
+ValidationStatus = Literal["PASS", "WARNING", "FAIL"]
+
+
+class ValidationCheck(StrictModel):
+    check: str
+    status: ValidationStatus
+    finding: str
+
+
+class ValidationIssue(StrictModel):
+    status: Literal["WARNING", "FAIL"]
+    location: str
+    issue: str
+
+
+class TraceCoverage(StrictModel):
+    total_fr: int
+    fr_in_rtm: int
+    fr_with_story: int
+    fr_with_design: int
+    percent: float
+    unresolved: int
+    invalid: int
+    orphaned: int
+
+
+class NfVerification(StrictModel):
+    nf_id: str
+    criterion: str
+    status: ValidationStatus
+
+
+class DocumentValidation(StrictModel):
+    """Validation report (section 8 of the SRS rules), from the stored artifacts."""
+
+    summary: list[ValidationCheck]
+    coverage: TraceCoverage
+    issues: list[ValidationIssue] = Field(default_factory=list)
+    nf_report: list[NfVerification] = Field(default_factory=list)
+    clarifications: list[str] = Field(default_factory=list)
+    # FINAL is only allowed without confirmed failures
+    ready_for_final: bool
+
+
+class DocumentHistoryEntry(StrictModel):
+    version: int
+    created_at: datetime
+    published: bool
+    changes: list[str] = Field(default_factory=list)
+    changed_sections: list[str] = Field(default_factory=list)
+    edited_sections: list[str] = Field(default_factory=list)
 
 
 class SectionEdit(StrictModel):
@@ -218,12 +273,13 @@ class ArtifactLinks(StrictModel):
     @model_validator(mode="after")
     def normalize_ids(self) -> ArtifactLinks:
         patterns = {
-            "us": r"^US-\d+-\d{2}$",
-            "uc": r"^UC-\d{2}$",
-            "ad": r"^AD-\d{2}$",
-            "cd": r"^CD-\d{2}$",
-            "sq": r"^SQ-\d{2}$",
-            "dfd": r"^DFD-\d{2}$",
+            # Role code: a letter (US-A-01); digits from older drafts still pass
+            "us": r"^US-[A-Z0-9]+-\d{2,}$",
+            "uc": r"^UC-\d{2,}$",
+            "ad": r"^AD-\d{2,}$",
+            "cd": r"^CD-\d{2,}$",
+            "sq": r"^SQ-\d{2,}$",
+            "dfd": r"^DFD-\d{2,}$",
         }
         for key, pattern in patterns.items():
             ids = list(
@@ -308,6 +364,8 @@ class RequirementCandidate(DeliberationItem):
     statement: str = Field(min_length=5)
     kind: Literal["functional", "non_functional", "constraint", "business_rule"]
     priority: Literal["must", "should", "could", "wont"]
+    # "stated" only when a source or agreed scheme gives the priority
+    priority_basis: Literal["stated", "assumed"] = "assumed"
     source_basis: Literal["explicit", "inferred", "assumption"]
 
     @model_validator(mode="after")
@@ -440,6 +498,8 @@ class DocTable(StrictModel):
     caption: str = Field(default="", max_length=300)
     columns: list[str] = Field(min_length=1, max_length=10)
     rows: list[list[str]] = Field(default_factory=list, max_length=60)
+    # One review key per row (set when the draft is assembled; the agents leave it empty)
+    item_keys: list[str] = Field(default_factory=list)
 
 
 DiagramKind = Literal["use_case", "activity", "class", "sequence", "context", "dfd"]
@@ -472,6 +532,11 @@ class UseCase(StrictModel):
     story_ids: list[str] = Field(default_factory=list)
 
 
+# Empty RTM cell: "—" (not relevant), [BELUM TERSEDIA] (relevant artifact not created
+# yet) or [PERLU KONFIRMASI] (relationship cannot be established confidently)
+TraceMarker = Literal["not_applicable", "pending", "needs_confirmation"]
+
+
 class TraceabilityRow(StrictModel):
     """One functional requirement and the artifacts that declare they cover it."""
 
@@ -482,6 +547,17 @@ class TraceabilityRow(StrictModel):
     cd: list[str] = Field(default_factory=list)
     sq: list[str] = Field(default_factory=list)
     dfd: list[str] = Field(default_factory=list)
+    markers: dict[str, TraceMarker] = Field(default_factory=dict)
+
+
+class ArtifactRegistry(StrictModel):
+    """IDs issued so far, so an ID survives new versions and is never reused."""
+
+    # Casefolded role name -> role code letter in US-<code>-YY
+    role_codes: dict[str, str] = Field(default_factory=dict)
+    # "US-A", "UC", "AD", ... -> highest number issued
+    counters: dict[str, int] = Field(default_factory=dict)
+    retired: list[str] = Field(default_factory=list)
 
 
 SectionKind = Literal[
@@ -509,6 +585,14 @@ class DocumentDraftOutput(StrictModel):
     user_stories: list[UserStory] = Field(default_factory=list)
     use_cases: list[UseCase] = Field(default_factory=list)
     traceability: list[TraceabilityRow] = Field(default_factory=list)
+    registry: ArtifactRegistry = Field(default_factory=ArtifactRegistry)
+    # References an artifact made to an ID that does not exist; dropped and reported
+    invalid_references: list[str] = Field(default_factory=list)
+    # Filled when the version is saved: what changed against the previous version
+    changes: list[str] = Field(default_factory=list)
+    changed_sections: list[str] = Field(default_factory=list)
+    # Review of each table row and diagram, keyed by its item key
+    item_reviews: dict[str, ItemReview] = Field(default_factory=dict)
     publication_ready: bool = False
 
     @field_validator("publication_ready")
@@ -517,6 +601,75 @@ class DocumentDraftOutput(StrictModel):
         if value:
             raise ValueError("agent-generated documents are always drafts")
         return value
+
+
+class ItemReview(StrictModel):
+    """A person's decision on one table row or diagram of the draft."""
+
+    state: Literal["pending", "approved", "rejected"] = "pending"
+    actor_id: str | None = None
+    at: datetime | None = None
+    note: str | None = None
+    # Last person who changed the item's content; their version wins over agents
+    edited_by: str | None = None
+
+
+class ItemReviewCreate(StrictModel):
+    action: Literal["approve", "reject", "reopen"]
+    actor_id: str = Field(min_length=1, max_length=200)
+    note: str | None = Field(default=None, max_length=2_000)
+
+
+class ItemBulkReviewCreate(ItemReviewCreate):
+    keys: list[str] = Field(min_length=1, max_length=200)
+
+
+class ItemEdit(StrictModel):
+    """New content for one item; only the fields of its kind are used."""
+
+    actor_id: str = Field(min_length=1, max_length=200)
+    # Table row
+    cells: list[str] | None = None
+    # User story
+    role: str | None = Field(default=None, max_length=120)
+    story: str | None = Field(default=None, max_length=2_000)
+    acceptance_criteria: list[str] | None = None
+    # Use case
+    name: str | None = Field(default=None, max_length=300)
+    actors: list[str] | None = None
+    story_ids: list[str] | None = None
+    # Diagram
+    title: str | None = Field(default=None, max_length=300)
+    mermaid: str | None = Field(default=None, max_length=20_000)
+    description: str | None = Field(default=None, max_length=2_000)
+    # Story, use case and diagram
+    requirement_ids: list[str] | None = None
+
+
+class SourceRef(StrictModel):
+    """A stored source, for 1.4 Referensi (only sources actually used)."""
+
+    source_id: str
+    title: str
+    source_type: str
+    author: str | None = None
+    date: str
+
+
+class PreviousDiagram(StrictModel):
+    diagram_id: str
+    kind: DiagramKind
+    title: str
+    requirement_ids: list[str] = Field(default_factory=list)
+
+
+class PreviousArtifacts(StrictModel):
+    """The current version's artifacts, so their IDs carry over to the next one."""
+
+    stories: list[UserStory] = Field(default_factory=list)
+    use_cases: list[UseCase] = Field(default_factory=list)
+    diagrams: list[PreviousDiagram] = Field(default_factory=list)
+    registry: ArtifactRegistry = Field(default_factory=ArtifactRegistry)
 
 
 class RequirementRef(StrictModel):
@@ -535,6 +688,10 @@ class DocumentWriterInput(ConflictAnalysisInput):
     # Every current requirement of the project plus this run's candidates, so each
     # document version is complete rather than covering only the latest upload
     project_requirements: list[RequirementRef] = Field(default_factory=list)
+    sources: list[SourceRef] = Field(default_factory=list)
+    # Stories and use cases of the current version: reuse their IDs when unchanged
+    previous_stories: list[UserStory] = Field(default_factory=list)
+    previous_use_cases: list[UseCase] = Field(default_factory=list)
 
 
 class WriterSection(StrictModel):
@@ -577,10 +734,22 @@ class DiagramWriterInput(StrictModel):
     requirements: list[RequirementRef]
     stories: list[UserStory]
     use_cases: list[UseCase]
+    # Diagrams of the current version (no Mermaid source): reuse IDs when unchanged
+    previous_diagrams: list[PreviousDiagram] = Field(default_factory=list)
+
+
+class PendingArtifact(StrictModel):
+    """A diagram a requirement needs that is not drawn yet, or an uncertain link."""
+
+    requirement_id: str
+    kind: DiagramKind
+    status: Literal["pending", "needs_confirmation"]
+    reason: str = Field(default="", max_length=300)
 
 
 class DiagramWriterOutput(StrictModel):
     diagrams: list[DiagramArtifact] = Field(default_factory=list, max_length=20)
+    pending: list[PendingArtifact] = Field(default_factory=list)
 
 
 class WorkflowInput(StrictModel):
@@ -750,6 +919,7 @@ class SourceBatch(StrictModel):
         return sources
 
 
+DocumentDraftOutput.model_rebuild()
 WorkspaceRequirementView.model_rebuild()
 WorkspaceConflictView.model_rebuild()
 WorkspaceDocumentView.model_rebuild()

@@ -1,9 +1,14 @@
 """Builds the SRS in the SpecBridge template from the writer agents' output.
 
 The agents write content; this module owns structure. Section order and titles,
-artifact IDs (US-X-YY, UC-XX, AD-XX, CD-XX, SQ-XX, DFD-XX) and the traceability
-matrix are deterministic, so every draft follows the template and the matrix only
-holds relations an artifact declared, never invented ones.
+artifact IDs (US-X-YY, UC-XX, AD-XX, CD-XX, SQ-XX, DFD-XX), the references table
+and the traceability matrix are deterministic:
+
+- IDs come from a registry kept with the document: an artifact that still exists
+  keeps its ID, a new one gets the next number, and a retired ID is never reused.
+- The matrix only holds relations an artifact declared. An empty cell says why it
+  is empty: not relevant (—), not created yet ([BELUM TERSEDIA]) or uncertain
+  ([PERLU KONFIRMASI]).
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ import re
 from collections.abc import Iterable
 
 from app.domain.schemas import (
+    ArtifactRegistry,
     DiagramArtifact,
     DiagramKind,
     DiagramWriterOutput,
@@ -19,10 +25,13 @@ from app.domain.schemas import (
     DocumentDraftOutput,
     DocumentSection,
     DocumentWriterOutput,
+    PreviousArtifacts,
     RequirementRef,
     SectionKind,
+    SourceRef,
     StoryWriterOutput,
     TraceabilityRow,
+    TraceMarker,
     UseCase,
     UserStory,
 )
@@ -33,12 +42,7 @@ TEMPLATE: list[tuple[str, str, SectionKind, list[str] | None]] = [
     ("1.1", "Tujuan", "text", []),
     ("1.2", "Lingkup Masalah", "text", []),
     ("1.3", "Daftar Istilah", "text", ["Istilah / Singkatan", "Definisi"]),
-    (
-        "1.4",
-        "Referensi",
-        "text",
-        ["No.", "Judul / Sumber", "Versi / Tanggal", "Tautan / Keterangan"],
-    ),
+    ("1.4", "Referensi", "text", []),
     ("1.5", "Deskripsi Umum", "text", []),
     ("2", "DESKRIPSI KESELURUHAN", "text", []),
     ("2.1", "Perspektif Produk", "text", []),
@@ -97,7 +101,9 @@ TEMPLATE: list[tuple[str, str, SectionKind, list[str] | None]] = [
     ("4", "TRACEABILITY MATRIX", "traceability", None),
 ]
 
-# Sections the writer agent fills (text and tables)
+REFERENCE_COLUMNS = ["No.", "Judul / Sumber", "Versi / Tanggal", "Tautan / Keterangan"]
+
+# Sections the writer agent fills (text and tables); 1.4 is listed for its text only
 WRITER_SECTIONS = [
     (number, title, columns)
     for number, title, _, columns in TEMPLATE
@@ -123,11 +129,25 @@ MERMAID_HEADERS: dict[DiagramKind, tuple[str, ...]] = {
     "dfd": ("flowchart", "graph"),
 }
 
+# RTM column -> diagram kind
+RTM_DIAGRAM_COLUMNS: dict[str, DiagramKind] = {
+    "ad": "activity",
+    "cd": "context",
+    "sq": "sequence",
+    "dfd": "dfd",
+}
+
 FUNCTIONAL_KINDS = {"functional", "business_rule"}
 MAX_STORIES = 40
 MAX_USE_CASES = 20
+NEEDS_CONFIRMATION = "[PERLU KONFIRMASI]"
+NOT_YET_AVAILABLE = "[BELUM TERSEDIA]"
 NOT_APPLICABLE = (
     "Tidak berlaku: sumber yang diunggah belum memuat informasi untuk bagian ini."
+)
+DIAGRAM_NOT_AVAILABLE = (
+    f"{NOT_YET_AVAILABLE} Informasi pada sumber belum cukup untuk membuat diagram ini "
+    "tanpa mengarang desain."
 )
 
 
@@ -144,6 +164,7 @@ def clean_mermaid(source: str) -> str:
 
 
 def _replace_ids(text: str, mapping: dict[str, str]) -> str:
+    mapping = {old: new for old, new in mapping.items() if old != new}
     if not mapping:
         return text
     pattern = re.compile(
@@ -154,37 +175,96 @@ def _replace_ids(text: str, mapping: dict[str, str]) -> str:
     return pattern.sub(lambda match: mapping[match.group(1)], text)
 
 
-def _known(ids: Iterable[str], allowed: set[str]) -> list[str]:
-    return list(dict.fromkeys(item for item in ids if item in allowed))
+def _role_letter(index: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA."""
+    letters = ""
+    index += 1
+    while index:
+        index, rest = divmod(index - 1, 26)
+        letters = chr(65 + rest) + letters
+    return letters
+
+
+class IdAllocator:
+    """Hands out IDs from the registry: keep a previous ID, or issue the next one."""
+
+    def __init__(self, registry: ArtifactRegistry) -> None:
+        self.registry = registry.model_copy(deep=True)
+        self.used: set[str] = set()
+
+    def role_code(self, role: str) -> str:
+        key = role.strip().casefold()
+        if key not in self.registry.role_codes:
+            taken = set(self.registry.role_codes.values())
+            index = 0
+            while _role_letter(index) in taken:
+                index += 1
+            self.registry.role_codes[key] = _role_letter(index)
+        return self.registry.role_codes[key]
+
+    def take(self, prefix: str, previous: str | None, allowed: set[str]) -> str:
+        if previous and previous in allowed and previous not in self.used:
+            number = previous.rsplit("-", 1)[-1]
+            if number.isdigit():
+                self.registry.counters[prefix] = max(
+                    self.registry.counters.get(prefix, 0), int(number)
+                )
+            self.used.add(previous)
+            return previous
+        self.registry.counters[prefix] = self.registry.counters.get(prefix, 0) + 1
+        new_id = f"{prefix}-{self.registry.counters[prefix]:02d}"
+        self.used.add(new_id)
+        return new_id
+
+
+def _known(
+    owner: str, ids: Iterable[str], allowed: set[str], invalid: list[str]
+) -> list[str]:
+    kept: list[str] = []
+    for item in dict.fromkeys(ids):
+        if item in allowed:
+            kept.append(item)
+        else:
+            invalid.append(f"{owner} → {item}")
+    return kept
 
 
 def renumber_stories(
-    stories: StoryWriterOutput, allowed_requirements: set[str]
+    stories: StoryWriterOutput,
+    functional_ids: set[str],
+    ids: IdAllocator,
+    previous: PreviousArtifacts,
+    invalid: list[str],
 ) -> tuple[list[UserStory], list[UseCase], dict[str, str]]:
-    """US-<role code>-<nn> in order of appearance; UC-<nn>. Returns an old→new map."""
-    role_codes: dict[str, int] = {}
-    per_role: dict[int, int] = {}
+    """US-<role code>-<nn> and UC-<nn>, keeping previous IDs. Returns an old→new map."""
+    previous_story = {story.story_id: story for story in previous.stories}
     mapping: dict[str, str] = {}
     renumbered: list[UserStory] = []
     for story in stories.stories[:MAX_STORIES]:
-        role_key = story.role.strip().casefold()
-        code = role_codes.setdefault(role_key, len(role_codes) + 1)
-        per_role[code] = per_role.get(code, 0) + 1
-        new_id = f"US-{code}-{per_role[code]:02d}"
+        code = ids.role_code(story.role)
+        prefix = f"US-{code}"
+        same_role = {
+            story_id
+            for story_id, old in previous_story.items()
+            if old.role.strip().casefold() == story.role.strip().casefold()
+        }
+        new_id = ids.take(prefix, story.story_id, same_role)
         mapping[story.story_id] = new_id
         renumbered.append(
             story.model_copy(
                 update={
                     "story_id": new_id,
+                    # A user story implements functional requirements only
                     "requirement_ids": _known(
-                        story.requirement_ids, allowed_requirements
+                        new_id, story.requirement_ids, functional_ids, invalid
                     ),
                 }
             )
         )
+    previous_cases = {use_case.use_case_id for use_case in previous.use_cases}
     use_cases: list[UseCase] = []
-    for index, use_case in enumerate(stories.use_cases[:MAX_USE_CASES], start=1):
-        new_id = f"UC-{index:02d}"
+    for use_case in stories.use_cases[:MAX_USE_CASES]:
+        new_id = ids.take("UC", use_case.use_case_id, previous_cases)
         mapping[use_case.use_case_id] = new_id
         use_cases.append(use_case.model_copy(update={"use_case_id": new_id}))
     story_ids = {story.story_id for story in renumbered}
@@ -192,11 +272,16 @@ def renumber_stories(
         use_case.model_copy(
             update={
                 "requirement_ids": _known(
-                    use_case.requirement_ids, allowed_requirements
+                    use_case.use_case_id,
+                    use_case.requirement_ids,
+                    functional_ids,
+                    invalid,
                 ),
                 "story_ids": _known(
+                    use_case.use_case_id,
                     (mapping.get(item, item) for item in use_case.story_ids),
                     story_ids,
+                    invalid,
                 ),
             }
         )
@@ -209,8 +294,10 @@ def renumber_diagrams(
     output: DiagramWriterOutput,
     allowed_requirements: set[str],
     story_mapping: dict[str, str],
+    ids: IdAllocator,
+    previous: PreviousArtifacts,
+    invalid: list[str],
 ) -> list[DiagramArtifact]:
-    counters: dict[str, int] = {}
     diagrams: list[DiagramArtifact] = []
     for diagram in output.diagrams:
         source = clean_mermaid(diagram.mermaid)
@@ -218,16 +305,17 @@ def renumber_diagrams(
             # Unusable source: the frontend would only show an error
             continue
         _, prefix, _ = DIAGRAM_SECTIONS[diagram.kind]
-        counters[prefix] = counters.get(prefix, 0) + 1
+        same_kind = {d.diagram_id for d in previous.diagrams if d.kind == diagram.kind}
+        new_id = ids.take(prefix, diagram.diagram_id, same_kind)
         diagrams.append(
             diagram.model_copy(
                 update={
-                    "diagram_id": f"{prefix}-{counters[prefix]:02d}",
+                    "diagram_id": new_id,
                     # Use case and story IDs inside labels follow the renumbering
                     "mermaid": _replace_ids(source, story_mapping),
                     "description": _replace_ids(diagram.description, story_mapping),
                     "requirement_ids": _known(
-                        diagram.requirement_ids, allowed_requirements
+                        new_id, diagram.requirement_ids, allowed_requirements, invalid
                     ),
                 }
             )
@@ -240,57 +328,67 @@ def build_traceability(
     stories: list[UserStory],
     use_cases: list[UseCase],
     diagrams: list[DiagramArtifact],
+    pending: DiagramWriterOutput | None = None,
 ) -> list[TraceabilityRow]:
     story_reqs = {story.story_id: set(story.requirement_ids) for story in stories}
+    open_items = {
+        (item.requirement_id, item.kind): item.status
+        for item in (pending.pending if pending else [])
+    }
     rows: list[TraceabilityRow] = []
     for requirement in requirements:
         if requirement.kind not in FUNCTIONAL_KINDS:
             continue
         rid = requirement.requirement_id
-        us = [story.story_id for story in stories if rid in story.requirement_ids]
-        # A use case covers a requirement directly, or through one of its stories
-        uc = [
-            use_case.use_case_id
-            for use_case in use_cases
-            if rid in use_case.requirement_ids
-            or any(rid in story_reqs.get(story, set()) for story in use_case.story_ids)
-        ]
-        by_kind = {
-            kind: [
+        links: dict[str, list[str]] = {
+            "us": [story.story_id for story in stories if rid in story.requirement_ids],
+            # A use case covers a requirement directly, or through one of its stories
+            "uc": [
+                use_case.use_case_id
+                for use_case in use_cases
+                if rid in use_case.requirement_ids
+                or any(
+                    rid in story_reqs.get(story, set()) for story in use_case.story_ids
+                )
+            ],
+        }
+        for column, kind in RTM_DIAGRAM_COLUMNS.items():
+            links[column] = [
                 diagram.diagram_id
                 for diagram in diagrams
                 if diagram.kind == kind and rid in diagram.requirement_ids
             ]
-            for kind in ("activity", "context", "sequence", "dfd")
-        }
-        rows.append(
-            TraceabilityRow(
-                requirement_id=rid,
-                us=us,
-                uc=uc,
-                ad=by_kind["activity"],
-                cd=by_kind["context"],
-                sq=by_kind["sequence"],
-                dfd=by_kind["dfd"],
-            )
-        )
+        markers: dict[str, TraceMarker] = {}
+        for column, ids in links.items():
+            if ids:
+                continue
+            if column in {"us", "uc"}:
+                # Every functional requirement needs a story and a use case
+                markers[column] = "pending"
+            else:
+                markers[column] = open_items.get(
+                    (rid, RTM_DIAGRAM_COLUMNS[column]), "not_applicable"
+                )
+        rows.append(TraceabilityRow(requirement_id=rid, markers=markers, **links))
     return rows
 
 
-def _story_tables(stories: list[UserStory]) -> list[DocTable]:
+def story_tables(stories: list[UserStory], ids: IdAllocator) -> list[DocTable]:
+    codes = {code: role for role, code in ids.registry.role_codes.items()}
     roles: dict[str, list[UserStory]] = {}
     for story in stories:
         roles.setdefault(story.story_id.split("-")[1], []).append(story)
     tables = []
-    for code, items in roles.items():
+    for code in sorted(roles, key=lambda c: (len(c), c)):
+        items = sorted(roles[code], key=lambda s: section_sort_key(s.story_id))
         tables.append(
             DocTable(
-                caption=f"Role {code}: {items[0].role}",
+                caption=f"Role {code}: {items[0].role or codes.get(code, code)}",
                 columns=["US-ID", "FR-ID Terkait", "User Story", "Acceptance Criteria"],
                 rows=[
                     [
                         story.story_id,
-                        ", ".join(story.requirement_ids) or "—",
+                        ", ".join(story.requirement_ids) or NEEDS_CONFIRMATION,
                         story.story,
                         "\n".join(
                             f"{index}. {item}"
@@ -298,7 +396,7 @@ def _story_tables(stories: list[UserStory]) -> list[DocTable]:
                                 story.acceptance_criteria, start=1
                             )
                         )
-                        or "—",
+                        or NOT_YET_AVAILABLE,
                     ]
                     for story in items
                 ],
@@ -307,7 +405,7 @@ def _story_tables(stories: list[UserStory]) -> list[DocTable]:
     return tables
 
 
-def _use_case_table(use_cases: list[UseCase]) -> list[DocTable]:
+def use_case_table(use_cases: list[UseCase]) -> list[DocTable]:
     if not use_cases:
         return []
     return [
@@ -318,20 +416,74 @@ def _use_case_table(use_cases: list[UseCase]) -> list[DocTable]:
                 [
                     use_case.use_case_id,
                     use_case.name,
-                    ", ".join(use_case.actors) or "—",
-                    ", ".join([*use_case.requirement_ids, *use_case.story_ids]) or "—",
+                    ", ".join(use_case.actors) or NEEDS_CONFIRMATION,
+                    ", ".join([*use_case.requirement_ids, *use_case.story_ids])
+                    or NEEDS_CONFIRMATION,
                 ]
-                for use_case in use_cases
+                for use_case in sorted(use_cases, key=lambda u: u.use_case_id)
             ],
         )
     ]
+
+
+def _references_table(sources: list[SourceRef]) -> list[DocTable]:
+    """Only the sources the analysis actually read, as the rules require."""
+    if not sources:
+        return []
+    return [
+        DocTable(
+            caption="",
+            columns=REFERENCE_COLUMNS,
+            rows=[
+                [
+                    str(index),
+                    source.title,
+                    source.date,
+                    ", ".join(
+                        part
+                        for part in (
+                            f"Sumber {source.source_type}",
+                            f"oleh {source.author}" if source.author else "",
+                            f"ID {source.source_id}",
+                        )
+                        if part
+                    ),
+                ]
+                for index, source in enumerate(sources, start=1)
+            ],
+        )
+    ]
+
+
+def _with_every_nf(
+    tables: list[DocTable], requirements: list[RequirementRef]
+) -> list[DocTable]:
+    """Every non-functional requirement appears in 3.10; a row the writer left out
+    gets its statement and [PERLU KONFIRMASI] instead of an invented criterion."""
+    columns = next(c for n, _, _, c in TEMPLATE if n == "3.10") or []
+    table = tables[0] if tables else DocTable(columns=columns, rows=[])
+    listed = {row[0].strip() for row in table.rows if row}
+    missing = [
+        [
+            item.requirement_id,
+            NEEDS_CONFIRMATION,
+            item.statement,
+            f"{NEEDS_CONFIRMATION} Kriteria belum ditentukan",
+        ]
+        for item in requirements
+        if item.kind not in FUNCTIONAL_KINDS and item.requirement_id not in listed
+    ]
+    if not missing:
+        return tables
+    return [table.model_copy(update={"rows": [*table.rows, *missing]}), *tables[1:]]
 
 
 def _fit_table(table: DocTable, columns: list[str]) -> DocTable:
     """Template columns win; rows are padded or cut to the same width."""
     width = len(columns)
     rows = [
-        [str(cell) for cell in row[:width]] + ["—"] * (width - len(row[:width]))
+        [str(cell) for cell in row[:width]]
+        + [NEEDS_CONFIRMATION] * (width - len(row[:width]))
         for row in table.rows
         if any(str(cell).strip() for cell in row)
     ]
@@ -343,10 +495,21 @@ def assemble_document(
     stories: StoryWriterOutput,
     diagrams: DiagramWriterOutput,
     requirements: list[RequirementRef],
+    *,
+    sources: list[SourceRef] | None = None,
+    previous: PreviousArtifacts | None = None,
 ) -> DocumentDraftOutput:
+    previous = previous or PreviousArtifacts()
     allowed = {item.requirement_id for item in requirements}
-    user_stories, use_cases, mapping = renumber_stories(stories, allowed)
-    drawn = renumber_diagrams(diagrams, allowed, mapping)
+    functional = {
+        item.requirement_id for item in requirements if item.kind in FUNCTIONAL_KINDS
+    }
+    ids = IdAllocator(previous.registry)
+    invalid: list[str] = []
+    user_stories, use_cases, mapping = renumber_stories(
+        stories, functional, ids, previous, invalid
+    )
+    drawn = renumber_diagrams(diagrams, allowed, mapping, ids, previous, invalid)
     written = {section.number: section for section in writer.sections}
 
     sections: list[DocumentSection] = []
@@ -360,16 +523,21 @@ def assemble_document(
                 _fit_table(table, columns)
                 for table in (source.tables if source else [])
             ]
-        if number == "3.3":
-            tables = _story_tables(user_stories)
+        if number == "1.4":
+            tables = _references_table(sources or [])
+        elif number == "3.3":
+            tables = story_tables(user_stories, ids)
             content = (
                 "User story dikelompokkan per role dengan format “Sebagai [role], saya "
-                "ingin [tujuan], sehingga [manfaat].”"
+                "ingin [tujuan], sehingga [manfaat].” Setiap user story merujuk minimal "
+                "satu kebutuhan fungsional."
                 if user_stories
-                else NOT_APPLICABLE
+                else f"{NOT_YET_AVAILABLE} Belum ada user story yang didukung sumber."
             )
         elif number == "3.4":
-            tables = _use_case_table(use_cases)
+            tables = use_case_table(use_cases)
+        elif number == "3.10":
+            tables = _with_every_nf(tables, requirements)
         if columns is None and number not in {"3.3", "4"}:
             kind_for_section = next(
                 diagram_kind
@@ -377,13 +545,15 @@ def assemble_document(
                 if section_number == number
             )
             section_diagrams = [d for d in drawn if d.kind == kind_for_section]
-            if not section_diagrams and not tables:
-                content = NOT_APPLICABLE
+            if not section_diagrams:
+                # A mandatory section; the diagram is missing, not irrelevant
+                content = DIAGRAM_NOT_AVAILABLE
         if number == "4":
             content = (
                 "Hubungan kebutuhan fungsional dengan user story, use case, dan "
-                "diagram. Hanya relasi yang dinyatakan oleh artefaknya yang dicantumkan; "
-                "sel tanpa relasi ditandai “—”."
+                "diagram. Hanya relasi yang dinyatakan oleh artefaknya yang dicantumkan. "
+                "“—”: tidak relevan; [BELUM TERSEDIA]: artefak relevan belum dibuat; "
+                "[PERLU KONFIRMASI]: relasi belum dapat dipastikan."
             )
         # Headings have no text; 3.2 and 3.10 list the requirements themselves
         is_heading = "." not in number
@@ -424,7 +594,22 @@ def assemble_document(
         for s in extra
     )
 
-    return DocumentDraftOutput(
+    current = (
+        {story.story_id for story in user_stories}
+        | {use_case.use_case_id for use_case in use_cases}
+        | {diagram.diagram_id for diagram in drawn}
+    )
+    earlier = (
+        {story.story_id for story in previous.stories}
+        | {use_case.use_case_id for use_case in previous.use_cases}
+        | {diagram.diagram_id for diagram in previous.diagrams}
+    )
+    ids.registry.retired = sorted(
+        (set(ids.registry.retired) | (earlier - current)) - current,
+        key=lambda value: (value.rsplit("-", 1)[0], section_sort_key(value)),
+    )
+
+    draft = DocumentDraftOutput(
         title=writer.title,
         document_type=writer.document_type,
         sections=sections,
@@ -432,5 +617,14 @@ def assemble_document(
         open_questions=writer.open_questions,
         user_stories=user_stories,
         use_cases=use_cases,
-        traceability=build_traceability(requirements, user_stories, use_cases, drawn),
+        traceability=build_traceability(
+            requirements, user_stories, use_cases, drawn, diagrams
+        ),
+        registry=ids.registry,
+        invalid_references=invalid,
     )
+    # Late import: document_items builds on this module
+    from app.workflow.document_items import assign_item_keys
+
+    assign_item_keys(draft)
+    return draft

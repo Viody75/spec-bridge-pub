@@ -22,6 +22,7 @@ from app.domain.schemas import (
     ExtractionOutput,
     ModerationInput,
     ModeratorOutput,
+    PreviousArtifacts,
     RebuttalInput,
     RequirementRef,
     ReviewInput,
@@ -274,7 +275,7 @@ async def build_document_input(
 ) -> Event:
     conflict_context = ConflictAnalysisInput.model_validate(conflict_input)
     project_id = conflict_context.review_input.project_id
-    project_name, existing = await get_repository().get_writer_context(project_id)
+    context = await get_repository().get_writer_context(project_id)
     candidates = [
         RequirementRef(
             requirement_id=item.candidate_id,
@@ -288,13 +289,19 @@ async def build_document_input(
     payload = DocumentWriterInput(
         **conflict_context.model_dump(),
         conflicts=node_input,
-        project_name=project_name,
-        project_requirements=[*existing, *candidates],
+        project_name=context.project_name,
+        project_requirements=[*context.requirements, *candidates],
+        sources=context.sources,
+        previous_stories=context.previous.stories,
+        previous_use_cases=context.previous.use_cases,
     )
     return Event(
         output=payload,
         actions=EventActions(
-            state_delta={"document_input": payload.model_dump(mode="json")}
+            state_delta={
+                "document_input": payload.model_dump(mode="json"),
+                "previous_artifacts": context.previous.model_dump(mode="json"),
+            }
         ),
     )
 
@@ -302,6 +309,7 @@ async def build_document_input(
 def build_diagram_input(
     node_input: dict[str, Any],
     document_input: dict[str, Any],
+    previous_artifacts: dict[str, Any],
 ) -> Event:
     for key in ("document_writer", "story_writer"):
         if key not in node_input:
@@ -315,6 +323,7 @@ def build_diagram_input(
         requirements=context.project_requirements,
         stories=stories.stories,
         use_cases=stories.use_cases,
+        previous_diagrams=PreviousArtifacts.model_validate(previous_artifacts).diagrams,
     )
     return Event(output=payload)
 
@@ -332,9 +341,11 @@ def finalize_result(
     document: dict[str, Any],
     stories: dict[str, Any],
     document_input: dict[str, Any],
+    previous_artifacts: dict[str, Any],
 ) -> Event:
     workflow = WorkflowInput.model_validate(workflow_input)
     writer = DocumentWriterOutput.model_validate(document)
+    writer_input = DocumentWriterInput.model_validate(document_input)
     moderated = ModeratorOutput.model_validate(moderation)
     conflict_output = ConflictOutput.model_validate(conflicts)
     candidate_ids = {
@@ -384,7 +395,9 @@ def finalize_result(
             writer,
             StoryWriterOutput.model_validate(stories),
             node_input,
-            DocumentWriterInput.model_validate(document_input).project_requirements,
+            writer_input.project_requirements,
+            sources=writer_input.sources,
+            previous=PreviousArtifacts.model_validate(previous_artifacts),
         ),
         retrieval=TraceLinkerInput.model_validate(trace_input).candidates,
     )

@@ -5,7 +5,7 @@ import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -18,11 +18,18 @@ from app.domain.schemas import (
     ArtifactLinks,
     ConflictCommentCreate,
     ConflictDecisionCreate,
+    DocumentDraftOutput,
+    DocumentHistoryEntry,
+    DocumentValidation,
     ExistingRequirement,
+    ItemEdit,
+    ItemReview,
     ManualRequirementCreate,
     NormalizedSource,
     PersistedConflictRef,
     PersistedResources,
+    PreviousArtifacts,
+    PreviousDiagram,
     ProductProjectView,
     ProjectCreate,
     ProjectView,
@@ -33,6 +40,7 @@ from app.domain.schemas import (
     RtmRow,
     RunProgress,
     SectionEdit,
+    SourceRef,
     TraceItemView,
     WorkspaceConflictView,
     WorkspaceDocumentView,
@@ -57,8 +65,25 @@ from app.infrastructure.models import (
     TraceItem,
     TraceLink,
 )
+from app.workflow.document_items import (
+    all_item_keys,
+    apply_item_edit,
+    assign_item_keys,
+    carry_reviews,
+    item_snapshot,
+    refresh_derived,
+    review_of,
+)
+from app.workflow.validation import validate_document
 
 FINISHED_RUN_STATUSES = ("completed", "human_context_required")
+
+
+class WriterContext(NamedTuple):
+    project_name: str
+    requirements: list[RequirementRef]
+    sources: list[SourceRef]
+    previous: PreviousArtifacts
 
 
 class NotFoundError(RuntimeError):
@@ -220,6 +245,13 @@ class Repository:
                 )
                 if version:
                     document_view = self._document_view(document_row, version)
+                    document_view.validation = validate_document(
+                        load_draft(version.content),
+                        requirements,
+                    )
+                    document_view.history = await self._document_history(
+                        session, document_row
+                    )
 
             trace_rows = (
                 await session.scalars(
@@ -717,6 +749,7 @@ class Repository:
             settings = get_settings()
             # Candidate → requirement it became (or duplicates); similar ones wait
             placed: dict[str, str] = {}
+            created: list[str] = []
             retrieval = {
                 item.candidate.candidate_id: item.existing_candidates
                 for item in result.retrieval
@@ -779,6 +812,8 @@ class Repository:
 
                 if requirement_id:
                     placed[candidate_id] = requirement_id
+                if outcome == "added" and requirement_id:
+                    created.append(requirement_id)
                 session.add(
                     TraceItem(
                         project_id=result.project_id,
@@ -847,6 +882,16 @@ class Repository:
             content, section_edits = carry_human_section_edits(
                 replace_candidate_ids(result.document.model_dump(mode="json"), placed),
                 previous,
+            )
+            if previous:
+                draft = DocumentDraftOutput.model_validate(content)
+                carry_reviews(draft, load_draft(previous.content))
+                refresh_derived(
+                    draft, await self._requirement_refs(session, result.project_id)
+                )
+                content = draft.model_dump(mode="json")
+            content["changes"], content["changed_sections"] = describe_changes(
+                content, previous.content if previous else None, created, section_edits
             )
             await self._apply_agent_trace_links(
                 session, result.project_id, content.get("traceability", [])
@@ -995,6 +1040,24 @@ class Repository:
                 raise ConflictError(
                     "document cannot be published until analysis reaches consensus"
                 )
+            draft = load_draft(version.content)
+            pending = [
+                key
+                for key in all_item_keys(draft)
+                if review_of(draft, key).state == "pending"
+            ]
+            if pending:
+                raise ConflictError(
+                    f"document cannot be FINAL while {len(pending)} table row(s) or "
+                    f"diagram(s) await approval, e.g. {', '.join(pending[:3])}"
+                )
+            report = await self._validate_version(session, document.project_id, version)
+            if report and not report.ready_for_final:
+                failed = [issue for issue in report.issues if issue.status == "FAIL"]
+                raise ConflictError(
+                    "document cannot be FINAL while validation fails: "
+                    + "; ".join(f"{i.location}: {i.issue}" for i in failed[:3])
+                )
             version.published = True
             version.published_by = actor_id
             version.published_at = datetime.now(UTC)
@@ -1041,46 +1104,257 @@ class Repository:
                 )
             )
 
-    async def get_writer_context(
-        self, project_id: str
-    ) -> tuple[str, list[RequirementRef]]:
-        """Project name and every current, not rejected requirement for the writers.
+    async def get_writer_context(self, project_id: str) -> WriterContext:
+        """What the writers need besides this run: every current, not rejected
+        requirement, the stored sources (1.4 Referensi) and the current version's
+        artifacts, whose IDs the next version keeps.
 
         The workflow can also run on its own (eval, playground, A2A) for a project
-        that is not stored; it then has no earlier requirements.
+        that is not stored; it then has no earlier requirements or artifacts.
         """
         async with self._sessions() as session:
             project = await session.get(Project, project_id)
             if not project:
-                return project_id, []
-            rows = (
-                await session.execute(
-                    select(Requirement, RequirementRevision)
-                    .join(
-                        RequirementRevision,
-                        (RequirementRevision.requirement_id == Requirement.id)
-                        & (
-                            RequirementRevision.revision == Requirement.current_revision
-                        ),
-                    )
-                    .where(
-                        Requirement.project_id == project_id,
-                        Requirement.status != "rejected",
-                    )
-                    .order_by(Requirement.stable_id)
+                return WriterContext(project_id, [], [], PreviousArtifacts())
+            refs = await self._requirement_refs(session, project_id)
+            sources = [
+                SourceRef(
+                    source_id=row.source_key,
+                    title=row.title,
+                    source_type=row.source_type,
+                    author=row.author,
+                    date=(row.occurred_at or row.created_at).date().isoformat(),
                 )
-            ).all()
-            refs = [
-                RequirementRef(
-                    requirement_id=requirement.stable_id,
-                    statement=revision.statement,
-                    kind=requirement_kind(requirement.stable_id, revision.rationale),
-                    priority=revision.priority,
-                    origin="existing",
-                )
-                for requirement, revision in rows
+                for row in (
+                    await session.scalars(
+                        select(Source)
+                        .where(Source.project_id == project_id)
+                        .order_by(Source.created_at)
+                    )
+                ).all()
             ]
-            return project.name, refs
+            version = await self._current_version(session, project)
+            previous = PreviousArtifacts()
+            if version:
+                content = DocumentDraftOutput.model_validate(version.content)
+                previous = PreviousArtifacts(
+                    stories=content.user_stories,
+                    use_cases=content.use_cases,
+                    diagrams=[
+                        PreviousDiagram(
+                            diagram_id=diagram.diagram_id,
+                            kind=diagram.kind,
+                            title=diagram.title,
+                            requirement_ids=diagram.requirement_ids,
+                        )
+                        for section in content.sections
+                        for diagram in section.diagrams
+                    ],
+                    registry=content.registry,
+                )
+            return WriterContext(project.name, refs, sources, previous)
+
+    async def _requirement_refs(
+        self, session: Any, project_id: str
+    ) -> list[RequirementRef]:
+        """Every current, not rejected requirement of the project."""
+        rows = (
+            await session.execute(
+                select(Requirement, RequirementRevision)
+                .join(
+                    RequirementRevision,
+                    (RequirementRevision.requirement_id == Requirement.id)
+                    & (RequirementRevision.revision == Requirement.current_revision),
+                )
+                .where(
+                    Requirement.project_id == project_id,
+                    Requirement.status != "rejected",
+                )
+                .order_by(Requirement.stable_id)
+            )
+        ).all()
+        return [
+            RequirementRef(
+                requirement_id=requirement.stable_id,
+                statement=revision.statement,
+                kind=requirement_kind(requirement.stable_id, revision.rationale),
+                priority=revision.priority,
+                origin="existing",
+            )
+            for requirement, revision in rows
+        ]
+
+    async def _current_document(
+        self, session: Any, project_id: str
+    ) -> tuple[Document, DocumentVersion]:
+        project = await session.get(Project, project_id)
+        if not project:
+            raise NotFoundError(f"project {project_id!r} does not exist")
+        version = await self._current_version(session, project)
+        if version is None:
+            raise NotFoundError(
+                f"project {project_id!r} has no document yet; run an analysis first"
+            )
+        return await session.get(Document, version.document_id), version
+
+    @staticmethod
+    def _open_draft(
+        session: Any, document: Document, version: DocumentVersion
+    ) -> DocumentVersion:
+        """A published version is never changed: changes go to a new draft version."""
+        if version.published:
+            document.current_version += 1
+            version = DocumentVersion(
+                document_id=document.id,
+                run_id=version.run_id,
+                version=document.current_version,
+                content=version.content,
+                rtm=version.rtm,
+                section_edits=dict(version.section_edits or {}),
+            )
+            session.add(version)
+            document.status = "draft"
+            document.approval_decision = "pending"
+        return version
+
+    async def review_items(
+        self,
+        project_id: str,
+        keys: list[str],
+        *,
+        action: Literal["approve", "reject", "reopen"],
+        actor_id: str,
+        note: str | None = None,
+    ) -> WorkspaceDocumentView:
+        """Approve, reject or reopen table rows and diagrams of the draft."""
+        async with self._sessions() as session, session.begin():
+            document, version = await self._current_document(session, project_id)
+            version = self._open_draft(session, document, version)
+            draft = load_draft(version.content)
+            known = set(all_item_keys(draft))
+            missing = [key for key in keys if key not in known]
+            if missing:
+                raise NotFoundError(
+                    f"document item(s) {', '.join(missing)} do not exist"
+                )
+            state = {"approve": "approved", "reject": "rejected", "reopen": "pending"}[
+                action
+            ]
+            now = datetime.now(UTC)
+            for key in keys:
+                current = review_of(draft, key)
+                draft.item_reviews[key] = current.model_copy(
+                    update={
+                        "state": state,
+                        "actor_id": actor_id,
+                        "at": now,
+                        "note": note,
+                    }
+                )
+            # A rejected story, use case or diagram leaves the matrix, and comes back on reopen
+            refresh_derived(draft, await self._requirement_refs(session, project_id))
+            await self._save_draft(session, project_id, version, draft)
+            session.add(
+                AuditEvent(
+                    project_id=project_id,
+                    actor_id=actor_id,
+                    event_type=f"document.items_{state}",
+                    payload={
+                        "document_id": str(document.id),
+                        "version": version.version,
+                        "keys": keys,
+                        "note": note,
+                    },
+                )
+            )
+            await session.flush()
+            return self._document_view(document, version)
+
+    async def edit_item(
+        self, project_id: str, key: str, edit: ItemEdit
+    ) -> WorkspaceDocumentView:
+        """A person changes a table row, user story, use case or diagram.
+
+        The item goes back to review; the matrix follows changed links (RULE-15).
+        """
+        async with self._sessions() as session, session.begin():
+            document, version = await self._current_document(session, project_id)
+            draft = load_draft(version.content)
+            if key not in set(all_item_keys(draft)):
+                raise NotFoundError(f"document item {key} does not exist")
+            refs = await self._requirement_refs(session, project_id)
+            before = item_snapshot(draft, key)
+            apply_item_edit(
+                draft,
+                key,
+                edit,
+                functional_ids={
+                    ref.requirement_id
+                    for ref in refs
+                    if ref.kind in {"functional", "business_rule"}
+                },
+                requirement_ids={ref.requirement_id for ref in refs},
+            )
+            after = item_snapshot(draft, key)
+            if after == before:
+                return self._document_view(document, version)
+            version = self._open_draft(session, document, version)
+            draft.item_reviews[key] = ItemReview(
+                state="pending",
+                actor_id=edit.actor_id,
+                at=datetime.now(UTC),
+                note="Diubah; menunggu persetujuan.",
+                edited_by=edit.actor_id,
+            )
+            refresh_derived(draft, refs)
+            await self._save_draft(session, project_id, version, draft)
+            session.add(
+                AuditEvent(
+                    project_id=project_id,
+                    actor_id=edit.actor_id,
+                    event_type="document.item_edited",
+                    payload={
+                        "document_id": str(document.id),
+                        "version": version.version,
+                        "key": key,
+                        "before": before,
+                        "after": after,
+                    },
+                )
+            )
+            await session.flush()
+            return self._document_view(document, version)
+
+    async def _save_draft(
+        self,
+        session: Any,
+        project_id: str,
+        version: DocumentVersion,
+        draft: DocumentDraftOutput,
+    ) -> None:
+        # A new object, so the JSON column is flagged as changed
+        version.content = draft.model_dump(mode="json")
+        await self._apply_agent_trace_links(
+            session, project_id, version.content.get("traceability", [])
+        )
+
+    async def _current_version(
+        self, session: Any, project: Project
+    ) -> DocumentVersion | None:
+        document = await session.scalar(
+            select(Document).where(
+                Document.project_id == project.id,
+                Document.document_type == project.document_type,
+            )
+        )
+        if not document or not document.current_version:
+            return None
+        return await session.scalar(
+            select(DocumentVersion).where(
+                DocumentVersion.document_id == document.id,
+                DocumentVersion.version == document.current_version,
+            )
+        )
 
     async def decide_trace_item(
         self,
@@ -1274,6 +1548,55 @@ class Repository:
             await session.flush()
             return self._document_view(document, version)
 
+    async def _validate_version(
+        self, session: Any, project_id: str, version: DocumentVersion
+    ) -> DocumentValidation | None:
+        rows = (
+            await session.execute(
+                select(Requirement, RequirementRevision)
+                .join(
+                    RequirementRevision,
+                    (RequirementRevision.requirement_id == Requirement.id)
+                    & (RequirementRevision.revision == Requirement.current_revision),
+                )
+                .where(Requirement.project_id == project_id)
+            )
+        ).all()
+        requirements = [
+            await self._requirement_view(session, requirement, revision)
+            for requirement, revision in rows
+        ]
+        return validate_document(load_draft(version.content), requirements)
+
+    async def _document_history(
+        self, session: Any, document: Document
+    ) -> list[DocumentHistoryEntry]:
+        versions = (
+            await session.scalars(
+                select(DocumentVersion)
+                .where(DocumentVersion.document_id == document.id)
+                .order_by(DocumentVersion.version)
+            )
+        ).all()
+        history = []
+        for version in versions:
+            sections = version.content.get("sections", [])
+            history.append(
+                DocumentHistoryEntry(
+                    version=version.version,
+                    created_at=version.created_at,
+                    published=version.published,
+                    changes=version.content.get("changes", []),
+                    changed_sections=version.content.get("changed_sections", []),
+                    edited_sections=[
+                        str(sections[int(key)].get("number") or int(key) + 1)
+                        for key in (version.section_edits or {})
+                        if int(key) < len(sections)
+                    ],
+                )
+            )
+        return history
+
     async def _apply_agent_trace_links(
         self, session: Any, project_id: str, rows: list[dict[str, Any]]
     ) -> None:
@@ -1432,7 +1755,7 @@ class Repository:
             document_type=document.document_type,
             status=document.status,
             version=version.version,
-            content=version.content,
+            content=load_draft(version.content),
             rtm=[RtmRow.model_validate(item) for item in version.rtm],
             published=version.published,
             published_by=version.published_by,
@@ -1617,6 +1940,71 @@ def replace_candidate_ids(value: Any, placed: dict[str, str]) -> Any:
     if isinstance(value, dict):
         return {key: replace_candidate_ids(item, placed) for key, item in value.items()}
     return value
+
+
+def load_draft(content: dict[str, Any]) -> DocumentDraftOutput:
+    """A stored draft, with item keys for drafts saved before rows had them."""
+    draft = DocumentDraftOutput.model_validate(content)
+    assign_item_keys(draft)
+    return draft
+
+
+def describe_changes(
+    content: dict[str, Any],
+    previous: dict[str, Any] | None,
+    created: list[str],
+    section_edits: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Revision notes for Daftar Perubahan / Daftar Halaman Perubahan."""
+    if previous is None:
+        # Listing every requirement and artifact as "new" would repeat the document
+        return ["Draft pertama dibuat oleh agent SpecBridge."], []
+    changes: list[str] = []
+    if created:
+        changes.append(f"Kebutuhan baru: {', '.join(created)}.")
+
+    def artifact_ids(doc: dict[str, Any] | None) -> set[str]:
+        if not doc:
+            return set()
+        return (
+            {story["story_id"] for story in doc.get("user_stories", [])}
+            | {case["use_case_id"] for case in doc.get("use_cases", [])}
+            | {
+                diagram["diagram_id"]
+                for section in doc.get("sections", [])
+                for diagram in section.get("diagrams", [])
+            }
+        )
+
+    now, before = artifact_ids(content), artifact_ids(previous)
+    added = sorted(now - before)
+    removed = sorted(before - now)
+    if added:
+        changes.append(f"Artefak baru: {', '.join(added)}.")
+    if removed:
+        changes.append(
+            f"Artefak tidak lagi dipakai (ID dipensiunkan): {', '.join(removed)}."
+        )
+
+    def by_number(doc: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            str(section.get("number") or index + 1): {
+                key: section.get(key) for key in ("content", "tables", "diagrams")
+            }
+            for index, section in enumerate((doc or {}).get("sections", []))
+        }
+
+    old_sections, new_sections = by_number(previous), by_number(content)
+    changed = [
+        number
+        for number, body in new_sections.items()
+        if old_sections.get(number) != body
+    ]
+    if section_edits:
+        changes.append("Bagian yang ditulis ulang pengguna dipertahankan.")
+    if not changes and not changed:
+        changes.append("Tidak ada perubahan isi.")
+    return changes, changed
 
 
 def carry_human_section_edits(

@@ -30,6 +30,8 @@ from app.domain.schemas import (
     ExistingRequirement,
     HealthResponse,
     ImplementationStatusUpdate,
+    ItemBulkReviewCreate,
+    ItemEdit,
     ManualRequirementCreate,
     NormalizedSource,
     ProductProjectView,
@@ -355,6 +357,39 @@ async def update_section_body(
     return await repository.update_section_body(
         project_id, section_index, content=payload.content, actor_id=payload.actor_id
     )
+
+
+@v1.post(
+    "/projects/{project_id}/document/items/review",
+    response_model=WorkspaceDocumentView,
+)
+async def review_document_items(
+    project_id: str,
+    payload: ItemBulkReviewCreate,
+    repository: RepositoryDep,
+) -> WorkspaceDocumentView:
+    """Approve, reject or reopen table rows and diagrams (one key or a batch)."""
+    return await repository.review_items(
+        project_id,
+        payload.keys,
+        action=payload.action,
+        actor_id=payload.actor_id,
+        note=payload.note,
+    )
+
+
+@v1.patch(
+    "/projects/{project_id}/document/items/{item_key}",
+    response_model=WorkspaceDocumentView,
+)
+async def edit_document_item(
+    project_id: str,
+    item_key: str,
+    payload: ItemEdit,
+    repository: RepositoryDep,
+) -> WorkspaceDocumentView:
+    """Edit a table row, user story, use case or diagram; it goes back to review."""
+    return await repository.edit_item(project_id, item_key, payload)
 
 
 @v1.post("/conflicts/{conflict_id}/decisions", response_model=ApiMessage)

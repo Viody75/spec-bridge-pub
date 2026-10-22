@@ -91,7 +91,7 @@ not-subscriptable = "ignore"
 deprecated = "ignore"
 
 [tool.codespell]
-ignore-words-list = "analisis,atribut,lokal,rouge,sistem,wont"
+ignore-words-list = "analisis,atribut,lama,lokal,maka,rouge,sistem,tabel,wont"
 skip = "./locust_env,uv.lock,.venv,./frontend,**/package-lock.json,./artifacts,README.md,./tests/eval/datasets"
 
 

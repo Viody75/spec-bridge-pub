@@ -153,33 +153,38 @@ def test_assembly_follows_the_template_and_numbering_rules() -> None:
     assert numbers[-1] == "9.1"  # the writer's extra section is kept after the template
     sections = {section.number: section for section in doc.sections}
     assert sections["1.1"].content == "Dokumen ini ..."
-    # Template columns win; short rows are padded
+    # Template columns win; a missing cell needs confirmation
     glossary = sections["1.3"].tables[0]
     assert glossary.columns == ["Istilah / Singkatan", "Definisi"]
     assert glossary.rows == [
         ["SRS", "Software Requirement Specification"],
-        ["HR", "—"],
+        ["HR", "[PERLU KONFIRMASI]"],
     ]
     assert sections["1.2"].content.startswith("Tidak berlaku")
+    assert sections["1.4"].tables == []  # no stored sources in this test
     assert sections["3.2"].kind == "functional_requirements"
     assert sections["4"].kind == "traceability"
 
-    # US-<role>-<nn>: roles in order of appearance, matched case-insensitively
-    assert [s.story_id for s in doc.user_stories] == ["US-1-01", "US-2-01", "US-1-02"]
-    assert doc.user_stories[0].requirement_ids == ["FR-01"]  # unknown FR-99 dropped
+    # US-<role letter>-<nn>: roles in order of appearance, case-insensitive
+    assert [s.story_id for s in doc.user_stories] == ["US-A-01", "US-B-01", "US-A-02"]
+    assert doc.registry.role_codes == {"karyawan": "A", "atasan": "B"}
+    assert doc.user_stories[0].requirement_ids == ["FR-01"]
+    # FR-99 does not exist: dropped and reported
+    assert doc.invalid_references == ["US-A-01 → FR-99"]
     assert [t.caption for t in sections["3.3"].tables] == [
-        "Role 1: Karyawan",
-        "Role 2: Atasan",
+        "Role A: Karyawan",
+        "Role B: Atasan",
     ]
     assert doc.use_cases[0].use_case_id == "UC-01"
-    assert doc.use_cases[0].story_ids == ["US-2-01"]
+    assert doc.use_cases[0].story_ids == ["US-B-01"]
 
     assert [d.diagram_id for d in sections["3.5"].diagrams] == ["AD-01"]
     activity = sections["3.5"].diagrams[0]
     assert activity.mermaid.startswith("flowchart TD")  # fences removed
     assert "UC-01 ajukan" in activity.mermaid  # renumbered inside labels
     assert sections["3.6"].diagrams == []
-    assert sections["3.6"].content.startswith("Tidak berlaku")
+    # A mandatory section whose diagram is missing, not irrelevant
+    assert sections["3.6"].content.startswith("[BELUM TERSEDIA]")
     assert [d.diagram_id for d in sections["3.8"].diagrams] == ["CD-01"]
 
 
@@ -191,12 +196,14 @@ def test_traceability_only_holds_declared_relations() -> None:
     assert set(rows) == {"FR-01", "CAND-001"}
     assert rows["FR-01"].model_dump() == {
         "requirement_id": "FR-01",
-        "us": ["US-1-01"],
+        "us": ["US-A-01"],
         "uc": [],
         "ad": ["AD-01"],
         "cd": ["CD-01"],
         "sq": [],
         "dfd": [],
+        # Every FR needs a use case; diagrams nobody flagged are not relevant
+        "markers": {"uc": "pending", "sq": "not_applicable", "dfd": "not_applicable"},
     }
     # The use case covers CAND-001 through its story
     assert rows["CAND-001"].uc == ["UC-01"]
@@ -286,4 +293,10 @@ def test_rtm_row_type_still_validates() -> None:
 @pytest.mark.asyncio
 async def test_writer_context_for_a_project_that_is_not_stored(repository) -> None:  # noqa: F811
     # Direct workflow runs (eval, playground, A2A) use project ids never created
-    assert await repository.get_writer_context("eval-only") == ("eval-only", [])
+    context = await repository.get_writer_context("eval-only")
+    assert (context.project_name, context.requirements, context.sources) == (
+        "eval-only",
+        [],
+        [],
+    )
+    assert context.previous.stories == []

@@ -40,6 +40,13 @@ Rules:
   appears literally. Never invent a locator; leave an unavailable field null.
 - Write each statement in the language named by policy.document_language,
   phrased as one obligation of the system (in Indonesian: "Sistem harus ...").
+- Each statement is atomic (one behaviour or quality), specific, testable and
+  feasible. Never combine independent functions in one statement, and never
+  create requirements just to add entries.
+- Avoid unmeasurable wording such as "cepat", "mudah digunakan" or "sangat aman"
+  unless a verifiable criterion from the source is part of the statement.
+- priority_basis is "stated" only when a source or an agreed scheme gives the
+  priority; otherwise "assumed" (the priority then needs confirmation).
 - Set source_basis to explicit, inferred, or assumption. Inferred requirements
   need a clear rationale; unsupported proposals must be marked as assumptions.
 - Do not treat casual ideas as approved requirements. Record irrelevant material
@@ -192,12 +199,25 @@ Content rules:
 - 3.10 has one row per non-functional requirement or constraint: its ID, a quality
   category (kinerja, keamanan, ketersediaan, usability, ...), the requirement, and
   a measurable test criterion taken from the sources or QA reasoning. If no
-  measure is supported, write "Belum ditentukan; perlu keputusan Product Owner".
-- Glossary, references, users, constraints, assumptions, stakeholders, interfaces
-  and attributes come only from the sources, requirements and reviews. Never
-  invent an organisation, regulation, system or person. When the input has no
-  information for a section, write "Tidak berlaku" with the reason, as the
-  template asks, instead of guessing.
+  measure is supported, write "[PERLU KONFIRMASI] Kriteria belum ditentukan".
+  Never invent a response time, percentage, availability or other target.
+- Glossary, users, constraints, assumptions, stakeholders, interfaces and
+  attributes come only from the sources, requirements and reviews. Never invent
+  an organisation, regulation, system, person, API, protocol or business goal.
+- Mark gaps instead of filling them: "[PERLU KONFIRMASI]" for information that
+  needs stakeholder approval, "[BELUM TERSEDIA]" for a supporting artifact that
+  does not exist yet, and "Tidak berlaku" with the reason only when a section
+  genuinely does not apply. State assumptions as assumptions, never as facts.
+- 1.2 covers the business problem, stakeholder needs, objectives, and what is in
+  and out of scope, all as supported by the sources.
+- 1.4: write one sentence only; the reference table is filled from the sources
+  that were actually analysed.
+- 2.3 lists the user roles; use the same role names as the sources so they match
+  the user stories and use cases.
+- 2.5: the first column is "Asumsi" or "Ketergantungan"; keep the two apart.
+- 2.6: an influence or interest level not stated in the sources is written with
+  "(asumsi)" after it.
+- 3.1: name a protocol, data format or external API only when a source names it.
 - Do not create new requirements or silently resolve disagreement.
 - Include unresolved conflicts, dissent, and human questions in open_questions.
 - rtm must include every candidate exactly once and preserve source IDs.
@@ -225,11 +245,18 @@ Rules:
   [tujuan], sehingga [manfaat]."
 - acceptance_criteria: 2 to 4 checkable conditions per story, including a failure
   or alternative condition when relevant. Use only thresholds the input supports.
-- requirement_ids: the IDs from project_requirements the story implements
-  (existing IDs such as FR-01, or CAND-NNN for new candidates). Only cite IDs
-  that are supplied; a story without a related requirement should not exist.
-- Give story_id values S1, S2, ... and use_case_id values UC1, UC2, ...; final
-  template IDs are assigned after you answer.
+- requirement_ids: the functional requirement IDs from project_requirements
+  the story implements (existing IDs such as FR-01, or CAND-NNN for new
+  candidates); never NF- IDs. Only cite supplied IDs: every story references at
+  least one existing functional requirement, and the story must really implement
+  it (meaning, not matching keywords).
+- acceptance criteria may use Given-When-Then ("Diberikan ..., ketika ...,
+  maka ...") and must stay consistent with the requirement.
+- previous_stories and previous_use_cases are the current version. When a story
+  or use case still describes the same need, return it with the same story_id or
+  use_case_id (e.g. US-A-01, UC-02) so its ID is kept. Give new ones S1, S2, ...
+  and UC1, UC2, ...; final IDs are assigned after you answer. Drop a previous
+  item only when no requirement supports it any more.
 - A use case names one user goal, its actors, the requirement_ids it covers and
   the story_ids it groups.
 - Cover every functional requirement with at least one story when the input
@@ -248,14 +275,16 @@ Language: write labels and descriptions in policy.document_language.
 Produce, when the input supports them:
 - kind "use_case": one diagram per module (at most 3). Mermaid "flowchart LR":
   actors as stadium nodes ([Aktor]) outside a subgraph named after the system;
-  use cases as rounded nodes (UC1: name) inside it; edges actor --- use case.
-  Use the supplied use_case_id values in the labels.
+  use cases as rounded nodes (UC1: name) inside it; edges actor --- use case;
+  dotted edges labelled "include" or "extend" only when the behaviour justifies
+  them. Use the supplied use_case_id values in the labels.
 - kind "activity": one per important scenario (at most 3). "flowchart TD" with
   a start ((Mulai)), actions, decisions such as D1{"Saldo cukup?"} with labelled
   branches and an
   end ((Selesai)). Use one subgraph per actor as a swimlane when useful.
 - kind "class": one "classDiagram" with the main domain classes, key attributes,
-  important operations and relations with cardinality.
+  important operations and relations with cardinality, only for entities the
+  requirements support. If the design is not defined well enough, draw none.
 - kind "sequence": one per important scenario (at most 3). "sequenceDiagram" with
   participants (actor, UI, services, data store), messages, responses, and an
   alt block for an important error path.
@@ -273,11 +302,22 @@ Mermaid rules, so every diagram renders:
   double quotes, e.g. A1["Ajukan cuti"]; never use double quotes inside a label.
 - One statement per line. Keep each diagram under 40 lines.
 
+Never draw a diagram only to fill a section. Use the same actor and component
+names in every diagram, matching the user stories and use cases.
+
 For every diagram set requirement_ids to the requirement IDs it really depicts
 (existing IDs such as FR-01, or CAND-NNN). These links build the traceability
-matrix, so never list a requirement the diagram does not show. diagram_id may be
-any short label; final IDs (AD-01, SQ-01, CD-01, DFD-01) are assigned after you
-answer. description: one or two sentences, including the trigger, actor and
+matrix, so never list a requirement the diagram does not show; check the meaning,
+not keywords.
+
+previous_diagrams are the current version. When a diagram still shows the same
+scenario, return it with the same diagram_id (e.g. AD-02) so its ID is kept; give
+new diagrams any short label; final IDs are assigned after you answer.
+
+pending: for a functional requirement whose scenario needs an activity, sequence,
+context or DFD diagram that you did not draw, add an entry with status "pending";
+when you cannot tell whether such a diagram relates to the requirement, use
+status "needs_confirmation". Leave out diagram types that do not apply. description: one or two sentences, including the trigger, actor and
 outcome for activity and sequence diagrams.
 """
 )
